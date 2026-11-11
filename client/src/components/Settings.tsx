@@ -251,7 +251,7 @@ function Marketplace({ team }: SettingsProps) {
         </button>
       </div>
       <p className="lead">
-        MCP servers give employees new abilities: GitHub, a browser, databases, Notion… They run locally on this computer through Claude Code. After adding one, enable it per employee in their profile.
+        MCP servers give employees new abilities: GitHub, a browser, databases, Notion… They run locally on this computer and work with every provider (Claude, Codex, Gemini and API models). After adding one, enable it per employee in their profile.
       </p>
       {installed.length > 0 && (
         <>

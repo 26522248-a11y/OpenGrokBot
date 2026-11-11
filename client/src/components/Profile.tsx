@@ -284,7 +284,7 @@ export function Profile({ team, agentId, usage, onClose, onSaved }: ProfileProps
           <label className="toggle-row">
             <div>
               <div className="toggle-title">Auto-approve every tool</div>
-              <div className="toggle-hint">Never block on permission prompts (Claude: incl. MCP; Codex: full-access sandbox; API: paths outside the folder).</div>
+              <div className="toggle-hint">Never block on permission prompts (Claude: incl. MCP; Codex: full-access sandbox; API: paths outside the folder, MCP tools).</div>
             </div>
             <input type="checkbox" className="toggle" checked={draft.autoApproveTools} onChange={(e) => set('autoApproveTools', e.target.checked)} />
           </label>

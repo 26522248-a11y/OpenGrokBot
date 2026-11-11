@@ -14,7 +14,11 @@ export class Store {
       try {
         const c = JSON.parse(readFileSync(path.join(this.dir, f), 'utf8')) as Conversation
         // A message that was streaming when the server died can never finish.
-        for (const m of c.messages) if (m.status === 'streaming') m.status = 'error'
+        for (const m of c.messages) {
+          if (m.status !== 'streaming') continue
+          m.status = 'error'
+          if (!m.text.trim()) m.text = '⚠️ Phiên trả lời bị ngắt (server khởi động lại hoặc model không phản hồi).'
+        }
         this.conversations.set(c.id, c)
       } catch (err) {
         console.warn(`[store] skipping unreadable ${f}:`, err)

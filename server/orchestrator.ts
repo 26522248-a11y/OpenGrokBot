@@ -15,6 +15,9 @@ interface RoundState {
   running: boolean
   abort: AbortController | null
   pending: { message: Message; forced?: Agent[]; note?: string }[]
+  activeMessages?: Set<string>
+  stopped?: boolean
+  generation?: number
 }
 
 /**
@@ -123,7 +126,23 @@ export class Orchestrator {
     const state = this.rounds.get(conversationId)
     if (!state) return
     state.pending = []
+    state.stopped = true
+    state.generation = (state.generation ?? 0) + 1
     state.abort?.abort()
+    // Finalize the live bubble right away: a stuck provider or child process must not
+    // leave the UI spinning after the owner pressed Stop.
+    for (const messageId of state.activeMessages ?? []) {
+      const msg = this.store.get(conversationId)?.messages.find((m) => m.id === messageId)
+      if (msg && msg.status === 'streaming') {
+        const text = msg.text.trim() || '⚠️ Đã dừng theo yêu cầu.'
+        const done = this.store.updateMessage(conversationId, messageId, { text, status: 'error' }) ?? { ...msg, text, status: 'error' as const }
+        emit({ type: 'message:done', message: done })
+      }
+    }
+    state.activeMessages = new Set()
+    state.running = false
+    state.abort = null
+    emit({ type: 'round', conversationId, running: false })
   }
 
   /** Runs a minimal Claude turn just to refresh the account's rate-limit picture. */
@@ -184,7 +203,7 @@ export class Orchestrator {
   private state(conversationId: string): RoundState {
     let s = this.rounds.get(conversationId)
     if (!s) {
-      s = { running: false, abort: null, pending: [] }
+      s = { running: false, abort: null, pending: [], activeMessages: new Set(), stopped: false, generation: 0 }
       this.rounds.set(conversationId, s)
     }
     return s
@@ -193,6 +212,9 @@ export class Orchestrator {
   private async runRound(conversationId: string, job: RoundState['pending'][number]): Promise<void> {
     const state = this.state(conversationId)
     state.running = true
+    state.stopped = false
+    state.activeMessages = new Set()
+    const generation = (state.generation = (state.generation ?? 0) + 1)
     state.abort = new AbortController()
     emit({ type: 'round', conversationId, running: true })
     const startIndex = this.store.get(conversationId)?.messages.length ?? 0
@@ -200,6 +222,8 @@ export class Orchestrator {
     try {
       await this.speakers(conversationId, job, state.abort.signal, spoke)
     } finally {
+      // A stopped round was already finalized; a newer round owns the state now.
+      if (state.generation !== generation) return
       state.running = false
       state.abort = null
       emit({ type: 'round', conversationId, running: false })
@@ -237,26 +261,77 @@ export class Orchestrator {
     const turns = new Map<string, number>()
     let count = 0
     let first = true
+    // The per-agent cap already bounds a chain (each agent may speak maxTurnsPerAgentPerRound
+    // times per round). Make the round cap at least that large so a legitimate handoff is
+    // never cut off silently; loops still stop when every member has used their turns.
+    const perAgent = Math.max(1, team.settings.maxTurnsPerAgentPerRound)
+    const hardCap = Math.max(team.settings.maxMessagesPerRound, team.agents.length * perAgent)
 
-    while (queue.length > 0 && count < team.settings.maxMessagesPerRound && !signal.aborted) {
-      const agent = queue.shift()
-      if (!agent) break
+    // Run a wave of independent agents together. File/shell tools are serialized by a
+    // process-wide lock, so parallel turns cannot corrupt the same repo.
+    const parallel = Math.max(1, Math.min(5, Number(process.env.OGB_PARALLEL_AGENTS ?? 4) || 4))
+    const manager = members[0]
+    while (queue.length > 0 && count < hardCap && !signal.aborted) {
       // A newer owner message arrived mid-round: let the next round handle it with fresh context.
       if (this.state(conversationId).pending.length > 0) break
-      count++
-      turns.set(agent.id, (turns.get(agent.id) ?? 0) + 1)
-      const buildNote = first && mode === 'build' && agent.tools.some((t) => ['Edit', 'Write'].includes(t)) ? BUILD_NOTE : undefined
-      const note = first ? (job.note ?? buildNote) : undefined
-      first = false
-      const reply = await this.turn(conversationId, agent, signal, note)
-      if (reply) spoke.add(agent.id)
-      if (!reply) continue
-      for (const m of findMentions(reply, members, agent.id)) {
-        const taken = turns.get(m.id) ?? 0
-        if (taken >= team.settings.maxTurnsPerAgentPerRound) continue
-        if (queue.some((q) => q.id === m.id)) continue
-        queue.push(m)
+      const batch: Agent[] = []
+      while (batch.length < parallel && queue.length > 0 && count + batch.length < hardCap) {
+        const next = queue[0]
+        if (!next) break
+        // The manager reviews only after every worker has reported, so it never shares a wave.
+        if (manager && next.id === manager.id && batch.length > 0) break
+        queue.shift()
+        batch.push(next)
+        if (manager && next.id === manager.id) break
       }
+      if (batch.length === 0) break
+      const batchNotes = batch.map((agent, index) => {
+        if (index > 0) return undefined
+        const buildNote = first && mode === 'build' && agent.tools.some((t) => ['Edit', 'Write'].includes(t)) ? BUILD_NOTE : undefined
+        return job.note ?? buildNote
+      })
+      first = false
+      count += batch.length
+      for (const agent of batch) turns.set(agent.id, (turns.get(agent.id) ?? 0) + 1)
+      const replies = await Promise.all(batch.map((agent, index) => this.turn(conversationId, agent, signal, batchNotes[index])))
+      batch.forEach((agent, index) => {
+        const reply = replies[index] ?? ''
+        if (reply) spoke.add(agent.id)
+        if (!reply) return
+        for (const m of findMentions(reply, members, agent.id)) {
+          const taken = turns.get(m.id) ?? 0
+          if (taken >= perAgent) continue
+          if (queue.some((q) => q.id === m.id)) continue
+          queue.push(m)
+        }
+      })
+      // Company loop: workers just reported, so hand the floor back to the manager to
+      // review the reports and assign the next tasks (bounded by the per-agent cap).
+      if (
+        members.length > 1 &&
+        manager &&
+        !manager.muted &&
+        !batch.some((a) => a.id === manager.id) &&
+        (turns.get(manager.id) ?? 0) < perAgent &&
+        !queue.some((q) => q.id === manager.id)
+      ) {
+        queue.push(manager)
+      }
+    }
+    if (queue.length > 0 && !signal.aborted) {
+      const waiting = queue.map((a) => a.name).join(', ')
+      console.warn(`[round] ${conversationId}: dừng sau ${count} lượt, còn chờ: ${waiting}`)
+      const notice = `⏸️ Tạm dừng chuỗi trao đổi sau ${count} lượt để tránh lặp. Còn chờ: ${waiting}. Gõ "tiếp tục" nếu muốn chạy tiếp.`
+      const message: Message = {
+        id: randomUUID(),
+        conversationId,
+        authorId: 'routine',
+        text: notice,
+        createdAt: Date.now(),
+        status: 'done',
+      }
+      this.store.addMessage(conversationId, message)
+      emit({ type: 'message:done', message })
     }
   }
 
@@ -275,6 +350,7 @@ export class Orchestrator {
       status: 'streaming',
       activity: [],
     }
+    this.state(conversationId).activeMessages?.add(message.id)
     emit({ type: 'typing', conversationId, agentId: agent.id, on: true })
     let started = false
     const start = (): void => {
@@ -287,7 +363,7 @@ export class Orchestrator {
     // Sessions are per provider kind: switching an employee to another provider starts fresh.
     const sessionKey = `${agent.id}@${provider.kind}`
     const sessionId = providerKeepsSession(provider.kind) ? conversation.sessions[sessionKey] : undefined
-    const notes = this.memory.read(agent.id)
+    const notes = [this.memory.read(agent.id), this.liveStatus(conversationId)].filter((x) => x && x.trim()).join('\n\n')
 
     const result = await runAgentTurn({
       team,
@@ -331,6 +407,34 @@ export class Orchestrator {
       },
     })
     emit({ type: 'typing', conversationId, agentId: agent.id, on: false })
+    const roundState = this.state(conversationId)
+    roundState.activeMessages?.delete(message.id)
+    if (roundState.stopped) return ''
+
+    // A manager working in a DM still has to reach the team: relay assignments that mention
+    // employees who are not in this DM into the shared group and dispatch them there.
+    if (conversation.kind === 'dm' && !result.error && result.text.trim() && !result.text.includes('↪️ Đã đăng việc này')) {
+      const outsiders = team.agents.filter((a) => !conversation.memberIds.includes(a.id))
+      const targets = findMentions(result.text, outsiders, agent.id)
+      if (targets.length > 0) {
+        // post() hands this array to the new round, which shifts it; snapshot names first.
+        const targetNames = targets.map((a) => a.name).join(', ')
+        try {
+          this.post(
+            'group',
+            `${result.text}\n\n↪️ (Chuyển tự động từ DM của ${agent.name})`,
+            {
+              authorId: agent.id,
+              forced: [...targets],
+              note: 'Việc này được chuyển từ DM sang nhóm. Hãy làm và báo cáo lại trong nhóm, @MINH khi xong.',
+            },
+          )
+          result.text += `\n\n↪️ Đã đăng việc này vào nhóm chung và giao cho ${targetNames}.`
+        } catch {
+          /* group may not exist yet; keep the DM reply */
+        }
+      }
+    }
 
     if (result.error && /session|resume|not found|No conversation found|thread/i.test(result.error) && sessionId) {
       // The stored session is gone (e.g. transcript deleted). Forget it and retry once fresh.
@@ -366,6 +470,40 @@ export class Orchestrator {
     emit({ type: 'message:done', message: done })
     this.emitUsage()
     return result.text
+  }
+
+  /** A snapshot of what the team is doing right now, so managers do not guess from old log files. */
+  private liveStatus(conversationId: string): string {
+    const team = this.getTeam()
+    const now = Date.now()
+    const lines: string[] = ['[Trạng thái đội ngũ — dữ liệu trực tiếp từ hệ thống, chính xác hơn log cũ]']
+    let running = 0
+    for (const [cid, st] of this.rounds) {
+      if (!st.running) continue
+      const conv = this.store.get(cid)
+      const active = [...(st.activeMessages ?? [])]
+        .map((id) => conv?.messages.find((m) => m.id === id))
+        .filter((m): m is Message => Boolean(m))
+      const who = active.length > 0 ? active.map((m) => team.agents.find((a) => a.id === m.authorId)?.name ?? m.authorId).join(', ') : 'một agent'
+      const secs = active.length > 0 ? Math.max(0, Math.round((now - Math.min(...active.map((m) => m.createdAt))) / 1000)) : 0
+      const steps = active.reduce((n, m) => n + (m.activity?.length ?? 0), 0)
+      lines.push(`- ĐANG CHẠY: ${who} trong "${conv?.name ?? cid}" (${secs}s, ${steps} bước)`)
+      if (st.pending.length > 0) lines.push(`- Đang chờ trong "${conv?.name ?? cid}": ${st.pending.length} yêu cầu`)
+      running++
+    }
+    if (running === 0) lines.push('- Không có agent nào đang chạy ngay lúc này.')
+    const conv = this.store.get(conversationId)
+    const recent = (conv?.messages ?? []).filter((m) => m.status === 'done' && m.authorId !== 'user').slice(-5)
+    if (recent.length > 0) {
+      lines.push('- Báo cáo gần nhất:')
+      for (const m of recent) {
+        const name = team.agents.find((a) => a.id === m.authorId)?.name ?? m.authorId
+        const mins = Math.max(0, Math.round((now - m.createdAt) / 60_000))
+        lines.push(`  · ${name} (${mins} phút trước): ${(m.text || '').replace(/\s+/g, ' ').slice(0, 160)}`)
+      }
+    }
+    lines.push('Nếu được hỏi "team đang làm gì", hãy dựa vào mục ĐANG CHẠY ở trên, không suy đoán từ file log cũ.')
+    return lines.join('\n')
   }
 
   private emitUsage(): void {
